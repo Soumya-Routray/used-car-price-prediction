@@ -14,6 +14,11 @@ Produces:
 """
 
 import json
+import shutil
+import tempfile
+import zipfile
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import joblib
@@ -27,18 +32,103 @@ from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-DATA_PATH = "data/used_cars.csv"
-MODEL_PATH = "models/best_model.joblib"
-METRICS_PATH = "models/metrics.json"
+# --- Paths: always anchored to this file, never to the current working directory ---
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_ROOT / "data"
+DATA_PATH = DATA_DIR / "used_cars.csv"
+DATA_ZIP = PROJECT_ROOT / "data.zip"
+MODEL_DIR = PROJECT_ROOT / "models"
+MODEL_PATH = MODEL_DIR / "best_model.joblib"
+METRICS_PATH = MODEL_DIR / "metrics.json"
+CSV_NAME = "used_cars.csv"
 CURRENT_YEAR = 2024
 
 NUM_FEATURES = ["milage", "car_age", "horsepower", "engine_size_l"]
 CAT_FEATURES = ["brand", "fuel_type", "transmission", "accident_reported", "clean_title_flag"]
 
 
-def load_and_clean(path: str = DATA_PATH) -> pd.DataFrame:
+def _find_csv(folder: Path):
+    """Return used_cars.csv found anywhere under `folder` (nested folders allowed), else None."""
+    if not folder.is_dir():
+        return None
+    for candidate in sorted(folder.rglob("*.csv")):
+        if candidate.name.lower() == CSV_NAME and "__MACOSX" not in candidate.parts:
+            return candidate
+    return None
+
+
+def _safe_extract(zip_path: Path, target: Path) -> None:
+    """
+    Extract a ZIP into `target`, refusing entries that would escape it (zip-slip).
+    A redundant leading "data/" folder inside the archive is dropped so the
+    result is data/used_cars.csv rather than data/data/used_cars.csv.
+    """
+    target.mkdir(parents=True, exist_ok=True)
+    target_resolved = target.resolve()
+    with zipfile.ZipFile(zip_path) as zf:
+        for member in zf.infolist():
+            if "__MACOSX" in member.filename:
+                continue
+            parts = Path(member.filename).parts
+            if parts and parts[0].lower() == "data" and target == DATA_DIR:
+                parts = parts[1:]
+            if not parts:
+                continue
+            dest = (target.joinpath(*parts)).resolve()
+            if target_resolved not in dest.parents:
+                raise ValueError(f"Unsafe path inside {zip_path.name}: {member.filename}")
+            if member.is_dir():
+                dest.mkdir(parents=True, exist_ok=True)
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(member) as src, open(dest, "wb") as out:
+                shutil.copyfileobj(src, out)
+
+
+def ensure_dataset() -> Path:
+    """
+    Return the absolute path to used_cars.csv.
+
+    Order: data/used_cars.csv -> any used_cars.csv already under data/ ->
+    extract data.zip (into data/, falling back to a temp dir if the project
+    folder is read-only) -> raise a clear FileNotFoundError.
+    The original data.zip / CSV are never modified or deleted.
+    """
+    if DATA_PATH.is_file():
+        return DATA_PATH
+
+    existing = _find_csv(DATA_DIR)
+    if existing is not None:
+        return existing
+
+    if not DATA_ZIP.is_file():
+        raise FileNotFoundError(
+            f"Dataset not found. Looked for:\n  - {DATA_PATH}\n  - {DATA_ZIP}\n"
+            f"Add '{CSV_NAME}' under data/, or commit data.zip (containing {CSV_NAME}) "
+            f"to the project root: {PROJECT_ROOT}"
+        )
+
+    for target in (DATA_DIR, Path(tempfile.gettempdir()) / "used_car_price_prediction_data"):
+        try:
+            _safe_extract(DATA_ZIP, target)
+        except zipfile.BadZipFile as exc:
+            raise RuntimeError(
+                f"{DATA_ZIP.name} is not a valid ZIP file (corrupt upload or a Git LFS pointer?)."
+            ) from exc
+        except OSError:
+            continue  # e.g. read-only project folder: retry in the temp dir
+        found = _find_csv(target)
+        if found is not None:
+            return found
+        raise FileNotFoundError(f"Extracted {DATA_ZIP.name}, but no '{CSV_NAME}' was inside it.")
+
+    raise OSError(f"Could not extract {DATA_ZIP} (no writable location available).")
+
+
+def load_and_clean(path=None) -> pd.DataFrame:
     """Load the raw CSV and clean/engineer features. Returns a model-ready DataFrame."""
-    df = pd.read_csv(path)
+    csv_path = Path(path) if path is not None else ensure_dataset()
+    df = pd.read_csv(csv_path)
     data = df.copy()
 
     # Target: strip "$" and "," -> float
@@ -167,11 +257,13 @@ def main():
     metrics["model_name"] = best_name
     print(f"CV R2: {cv_scores.mean():.3f} (+/- {cv_scores.std():.3f})")
 
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
     joblib.dump(best_pipe, MODEL_PATH)
-    with open(METRICS_PATH, "w") as f:
+    with open(METRICS_PATH, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
     print(f"\nSaved model to {MODEL_PATH}")
     print(f"Saved metrics to {METRICS_PATH}")
+    return metrics
 
 
 if __name__ == "__main__":
