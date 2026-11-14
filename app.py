@@ -8,6 +8,8 @@ The app loads the trained pipeline from models/best_model.joblib
 (preprocessing + model bundled together, so raw inputs go straight in).
 """
 
+import subprocess
+import sys
 from pathlib import Path
 
 import joblib
@@ -53,11 +55,22 @@ def find_model_file():
 
 
 @st.cache_resource
-def load_model():
-    model_file = find_model_file()
-    if model_file is None:
-        return None
+def load_model(model_file):
     return joblib.load(model_file)
+
+
+def train_model_if_missing():
+    """The repo has no saved model, so run train_model.py once to create it."""
+    script = APP_DIR / "train_model.py"
+    if not script.is_file():
+        return False, "train_model.py not found in the repo."
+    result = subprocess.run(
+        [sys.executable, str(script)], cwd=str(APP_DIR),
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return False, (result.stderr or result.stdout)[-2000:]
+    return True, ""
 
 
 def main():
@@ -65,16 +78,22 @@ def main():
 
     st.title("🚗 Used Car Price Predictor")
 
-    model = load_model()
+    model_file = find_model_file()
+    if model_file is None:
+        with st.spinner("No saved model found. Training it now (first run only)..."):
+            ok, message = train_model_if_missing()
+        model_file = find_model_file()
+        if not ok or model_file is None:
+            st.error(
+                "Model file not found. Commit models/best_model.joblib to your repo "
+                "(check .gitignore), or make sure train_model.py saves it there."
+            )
+            if message:
+                st.code(message)
+            st.write("Files in app folder:", sorted(p.name for p in APP_DIR.iterdir()))
+            st.stop()
 
-    if model is None:
-        st.error("Model file not found. Make sure models/best_model.joblib is committed to your repo.")
-        st.write("App folder:", str(APP_DIR))
-        st.write("Files in app folder:", sorted(p.name for p in APP_DIR.iterdir()))
-        models_dir = APP_DIR / "models"
-        if models_dir.exists():
-            st.write("Files in models/:", sorted(p.name for p in models_dir.iterdir()))
-        st.stop()
+    model = load_model(model_file)
 
     with st.container(border=True):
         st.subheader("🔧 Vehicle Details")
